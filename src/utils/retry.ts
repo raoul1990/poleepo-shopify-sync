@@ -6,6 +6,32 @@ export interface RetryOptions {
   onRetry?: (error: unknown, attempt: number) => void;
 }
 
+/** Check if an error is transient and worth retrying */
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const msg = error.message;
+    // Network / timeout errors are always retryable
+    if (
+      error.name === 'AbortError' ||
+      msg.includes('ECONNRESET') ||
+      msg.includes('ENOTFOUND') ||
+      msg.includes('ETIMEDOUT') ||
+      msg.includes('ECONNREFUSED') ||
+      msg.includes('fetch failed')
+    ) {
+      return true;
+    }
+    // HTTP status-based errors: only retry 429 and 5xx
+    const statusMatch = msg.match(/\((\d{3})\)/);
+    if (statusMatch) {
+      const status = parseInt(statusMatch[1], 10);
+      return status === 429 || status >= 500;
+    }
+  }
+  // Unknown errors: assume retryable
+  return true;
+}
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   options: RetryOptions = {}
@@ -16,7 +42,7 @@ export async function withRetry<T>(
     try {
       return await fn();
     } catch (error) {
-      if (attempt === maxRetries) {
+      if (!isRetryableError(error) || attempt === maxRetries) {
         throw error;
       }
       const delay = baseDelayMs * Math.pow(2, attempt - 1);

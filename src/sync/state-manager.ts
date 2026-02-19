@@ -40,13 +40,16 @@ export function loadState(): SyncState | null {
 
 export function saveState(state: SyncState): void {
   const filePath = getStatePath();
+  const tmpPath = filePath + '.tmp';
   const dir = path.dirname(filePath);
 
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
 
-  fs.writeFileSync(filePath, JSON.stringify(state, null, 2), 'utf-8');
+  // Write to temp file then rename for atomic operation
+  fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), 'utf-8');
+  fs.renameSync(tmpPath, filePath);
   logger.debug(`Sync state saved to ${filePath}`);
 }
 

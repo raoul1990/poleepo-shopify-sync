@@ -29,6 +29,7 @@ export interface PoleepoPublication {
 }
 
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000; // 5 minutes
+const REQUEST_TIMEOUT_MS = 30_000; // 30 seconds
 
 export class PoleepoClient {
   private token: TokenData | null = null;
@@ -40,6 +41,10 @@ export class PoleepoClient {
 
   private async authenticate(): Promise<void> {
     logger.debug('Authenticating with Poleepo...');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
     const res = await fetch(`${this.baseUrl}/oauth/access_token`, {
       method: 'POST',
       headers: {
@@ -51,6 +56,7 @@ export class PoleepoClient {
         client_secret: config.poleepo.apiSecret,
         grant: 'client_credentials',
       }),
+      signal: controller.signal,
     });
 
     if (!res.ok) {
@@ -64,6 +70,9 @@ export class PoleepoClient {
       expiresAt: Date.now() + json.data.expires_in * 1000,
     };
     logger.info('Poleepo authentication successful');
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private isTokenValid(): boolean {
@@ -81,47 +90,60 @@ export class PoleepoClient {
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const token = await this.ensureToken();
     const url = `${this.baseUrl}${path}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    const options: RequestInit = {
-      method,
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-    };
-
-    if (body !== undefined) {
-      options.body = JSON.stringify(body);
-    }
-
-    logger.debug(`Poleepo ${method} ${path}`);
-    const res = await fetch(url, options);
-
-    if (res.status === 401) {
-      logger.warn('Poleepo token expired, re-authenticating...');
-      await this.authenticate();
-      const newToken = this.token!.accessToken;
-      const retryOptions: RequestInit = {
-        ...options,
+    try {
+      const options: RequestInit = {
+        method,
         headers: {
-          'Authorization': `Bearer ${newToken}`,
+          'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
+        signal: controller.signal,
       };
-      const retryRes = await fetch(url, retryOptions);
-      if (!retryRes.ok) {
-        const text = await retryRes.text();
-        throw new Error(`Poleepo ${method} ${path} failed (${retryRes.status}): ${text}`);
+
+      if (body !== undefined) {
+        options.body = JSON.stringify(body);
       }
-      return retryRes.json() as Promise<T>;
-    }
 
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Poleepo ${method} ${path} failed (${res.status}): ${text}`);
-    }
+      logger.debug(`Poleepo ${method} ${path}`);
+      const res = await fetch(url, options);
 
-    return res.json() as Promise<T>;
+      if (res.status === 401) {
+        logger.warn('Poleepo token expired, re-authenticating...');
+        await this.authenticate();
+        const newToken = this.token!.accessToken;
+        const retryController = new AbortController();
+        const retryTimeout = setTimeout(() => retryController.abort(), REQUEST_TIMEOUT_MS);
+        try {
+          const retryRes = await fetch(url, {
+            ...options,
+            headers: {
+              'Authorization': `Bearer ${newToken}`,
+              'Content-Type': 'application/json',
+            },
+            signal: retryController.signal,
+          });
+          if (!retryRes.ok) {
+            const text = await retryRes.text();
+            throw new Error(`Poleepo ${method} ${path} failed (${retryRes.status}): ${text}`);
+          }
+          return retryRes.json() as Promise<T>;
+        } finally {
+          clearTimeout(retryTimeout);
+        }
+      }
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Poleepo ${method} ${path} failed (${res.status}): ${text}`);
+      }
+
+      return res.json() as Promise<T>;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async getProducts(offset: number = 0, max: number = 50, active: boolean = true): Promise<{ data: PoleepoProduct[]; total?: number }> {

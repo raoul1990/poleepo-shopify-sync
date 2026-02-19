@@ -17,6 +17,7 @@ export interface ShopifyProduct {
 }
 
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000; // 5 minutes
+const REQUEST_TIMEOUT_MS = 30_000; // 30 seconds
 
 export class ShopifyClient {
   private token: TokenData | null = null;
@@ -32,30 +33,37 @@ export class ShopifyClient {
   private async authenticate(): Promise<void> {
     logger.debug('Authenticating with Shopify...');
     const tokenUrl = `https://${config.shopify.store}/admin/oauth/access_token`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    const body = new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: config.shopify.clientId,
-      client_secret: config.shopify.clientSecret,
-    });
+    try {
+      const body = new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: config.shopify.clientId,
+        client_secret: config.shopify.clientSecret,
+      });
 
-    const res = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body.toString(),
-    });
+      const res = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+        signal: controller.signal,
+      });
 
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Shopify auth failed (${res.status}): ${text}`);
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Shopify auth failed (${res.status}): ${text}`);
+      }
+
+      const json = await res.json() as { access_token: string; expires_in: number };
+      this.token = {
+        accessToken: json.access_token,
+        expiresAt: Date.now() + json.expires_in * 1000,
+      };
+      logger.info('Shopify authentication successful');
+    } finally {
+      clearTimeout(timeout);
     }
-
-    const json = await res.json() as { access_token: string; expires_in: number };
-    this.token = {
-      accessToken: json.access_token,
-      expiresAt: Date.now() + json.expires_in * 1000,
-    };
-    logger.info('Shopify authentication successful');
   }
 
   private isTokenValid(): boolean {
@@ -74,48 +82,61 @@ export class ShopifyClient {
     await this.rateLimiter.acquire();
     const token = await this.ensureToken();
     const url = `${this.baseUrl}${path}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    const options: RequestInit = {
-      method,
-      headers: {
-        'X-Shopify-Access-Token': token,
-        'Content-Type': 'application/json',
-      },
-    };
-
-    if (body !== undefined) {
-      options.body = JSON.stringify(body);
-    }
-
-    logger.debug(`Shopify ${method} ${path}`);
-    const res = await fetch(url, options);
-
-    if (res.status === 401) {
-      logger.warn('Shopify token expired, re-authenticating...');
-      await this.authenticate();
-      const newToken = this.token!.accessToken;
-      await this.rateLimiter.acquire();
-      const retryOptions: RequestInit = {
-        ...options,
+    try {
+      const options: RequestInit = {
+        method,
         headers: {
-          'X-Shopify-Access-Token': newToken,
+          'X-Shopify-Access-Token': token,
           'Content-Type': 'application/json',
         },
+        signal: controller.signal,
       };
-      const retryRes = await fetch(url, retryOptions);
-      if (!retryRes.ok) {
-        const text = await retryRes.text();
-        throw new Error(`Shopify ${method} ${path} failed (${retryRes.status}): ${text}`);
+
+      if (body !== undefined) {
+        options.body = JSON.stringify(body);
       }
-      return retryRes.json() as Promise<T>;
-    }
 
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Shopify ${method} ${path} failed (${res.status}): ${text}`);
-    }
+      logger.debug(`Shopify ${method} ${path}`);
+      const res = await fetch(url, options);
 
-    return res.json() as Promise<T>;
+      if (res.status === 401) {
+        logger.warn('Shopify token expired, re-authenticating...');
+        await this.authenticate();
+        const newToken = this.token!.accessToken;
+        await this.rateLimiter.acquire();
+        const retryController = new AbortController();
+        const retryTimeout = setTimeout(() => retryController.abort(), REQUEST_TIMEOUT_MS);
+        try {
+          const retryRes = await fetch(url, {
+            ...options,
+            headers: {
+              'X-Shopify-Access-Token': newToken,
+              'Content-Type': 'application/json',
+            },
+            signal: retryController.signal,
+          });
+          if (!retryRes.ok) {
+            const text = await retryRes.text();
+            throw new Error(`Shopify ${method} ${path} failed (${retryRes.status}): ${text}`);
+          }
+          return retryRes.json() as Promise<T>;
+        } finally {
+          clearTimeout(retryTimeout);
+        }
+      }
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Shopify ${method} ${path} failed (${res.status}): ${text}`);
+      }
+
+      return res.json() as Promise<T>;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async getProducts(params: {
