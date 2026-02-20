@@ -8,16 +8,19 @@
 
 **Poleepo-Shopify Tag Sync** è un servizio Node.js standalone che sincronizza bidirezionalmente i tag dei prodotti tra la piattaforma Poleepo e lo store Shopify.
 
-Il servizio gira in background come processo persistente, eseguendo un ciclo di sincronizzazione ogni 15 minuti (configurabile). Non richiede interfaccia utente, Slack o altri front-end: è un agente autonomo che opera silenziosamente e logga la propria attività su console.
+Il servizio gira in background come processo persistente (systemd), eseguendo un ciclo di sincronizzazione ogni 6 ore (configurabile). Invia report su Slack al termine di ogni sync e logga la propria attività su console.
 
 ### Caratteristiche principali
 
 - **Sync bidirezionale**: i tag vengono uniti (merge) da entrambe le piattaforme. Non vengono mai rimossi tag esistenti.
 - **Sync incrementale**: dopo la prima esecuzione completa, vengono sincronizzati solo i prodotti effettivamente modificati.
 - **Auto-refresh token**: i token di autenticazione per Poleepo (~1h) e Shopify (~24h) vengono rinnovati automaticamente prima della scadenza.
+- **Dual auth Shopify**: supporta sia token statico (`SHOPIFY_ACCESS_TOKEN`) che flusso OAuth `client_credentials` con refresh automatico.
 - **Rate limiting**: rispetta il limite Shopify di 2 richieste/secondo con bucket di 40.
 - **Retry automatico**: le chiamate API fallite vengono ritentate fino a 3 volte con backoff esponenziale.
 - **Graceful shutdown**: il servizio termina in modo pulito attendendo la fine del ciclo di sync corrente.
+- **Prodotti eliminati**: i prodotti cancellati da Shopify (404) vengono saltati e rimossi dallo stato senza generare errori.
+- **Notifiche Slack**: report con Block Kit dopo ogni sync, con sanitizzazione HTML e protezione limite 3000 caratteri per blocco.
 
 ---
 
@@ -39,7 +42,8 @@ poleepo-shopify-sync/
 │   └── utils/
 │       ├── logger.ts            # Logger con timestamp ISO
 │       ├── rate-limiter.ts      # Token bucket per rispettare i limiti Shopify
-│       └── retry.ts             # Retry con exponential backoff
+│       ├── retry.ts             # Retry con exponential backoff
+│       └── slack.ts             # Notifiche Slack (webhook + file upload)
 ├── data/
 │   └── sync-state.json          # Stato di sync (generato a runtime)
 ├── dist/                        # Output compilato (generato da tsc)
@@ -124,6 +128,14 @@ I tag vengono sempre **uniti**, mai rimossi:
 
 ### 4.2 Shopify
 
+Il client supporta due modalità di autenticazione (mutualmente esclusive):
+
+**Opzione A — Token statico** (per app Custom con Admin API access token):
+- Impostare `SHOPIFY_ACCESS_TOKEN` nel `.env`
+- Il token viene usato direttamente senza scadenza
+- Se ritorna 401, tenta fallback su `client_credentials`
+
+**Opzione B — Client Credentials** (per app con OAuth, consigliata):
 - **Endpoint**: `POST https://{store}/admin/oauth/access_token`
 - **Formato**: `application/x-www-form-urlencoded` (NON JSON)
 - **Parametri**: `grant_type=client_credentials`, `client_id`, `client_secret`
@@ -136,7 +148,8 @@ Per entrambe le piattaforme:
 - Il token viene salvato in memoria con il timestamp di scadenza
 - Prima di ogni chiamata API viene verificata la validità del token
 - Se il token scade entro 5 minuti, viene rinnovato proattivamente
-- Se una chiamata ritorna HTTP 401, il token viene rinnovato e la chiamata ritentata
+- Se una chiamata ritorna HTTP 401, il token corrente viene invalidato, si riautentica e si ritenta la chiamata
+- I messaggi di errore HTML (es. pagine Shopify) vengono sanitizzati prima del logging
 
 ---
 
@@ -154,16 +167,24 @@ POLEEPO_BASE_URL=https://api.poleepo.cloud
 
 # ── Shopify ──────────────────────────────────────────
 SHOPIFY_STORE=tuonegozio.myshopify.com
+# Opzione A: token statico (se fornito, usato direttamente)
+SHOPIFY_ACCESS_TOKEN=
+# Opzione B: client credentials OAuth (consigliata — token con refresh automatico)
 SHOPIFY_CLIENT_ID=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 SHOPIFY_CLIENT_SECRET=shpss_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 SHOPIFY_API_VERSION=2025-07
 
 # ── Sync ─────────────────────────────────────────────
-SYNC_CRON=*/15 * * * *
+SYNC_CRON=0 */6 * * *
 SYNC_BATCH_SIZE=50
 TAG_CASE_SENSITIVE=false
 LOG_LEVEL=info
 STATE_FILE_PATH=./data/sync-state.json
+
+# ── Slack (opzionale) ────────────────────────────────
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_CHANNEL_ID=C...
 ```
 
 ### 5.2 Dettaglio parametri
@@ -174,21 +195,27 @@ STATE_FILE_PATH=./data/sync-state.json
 | `POLEEPO_API_SECRET` | Sì | — | API secret Poleepo |
 | `POLEEPO_BASE_URL` | No | `https://api.poleepo.cloud` | URL base API Poleepo |
 | `SHOPIFY_STORE` | Sì | — | Dominio dello store Shopify (es. `nome.myshopify.com`) |
-| `SHOPIFY_CLIENT_ID` | Sì | — | Client ID dell'app Shopify |
-| `SHOPIFY_CLIENT_SECRET` | Sì | — | Client Secret dell'app Shopify |
+| `SHOPIFY_ACCESS_TOKEN` | No | — | Token statico (alternativo a client_credentials) |
+| `SHOPIFY_CLIENT_ID` | No* | — | Client ID dell'app Shopify |
+| `SHOPIFY_CLIENT_SECRET` | No* | — | Client Secret dell'app Shopify |
 | `SHOPIFY_API_VERSION` | No | `2025-07` | Versione API Shopify |
-| `SYNC_CRON` | No | `*/15 * * * *` | Espressione cron per la frequenza di sync |
+| `SYNC_CRON` | No | `0 */6 * * *` | Espressione cron per la frequenza di sync |
 | `SYNC_BATCH_SIZE` | No | `50` | Numero di prodotti per pagina nelle chiamate API Poleepo |
 | `TAG_CASE_SENSITIVE` | No | `false` | Se `true`, i tag "Uomo" e "uomo" vengono trattati come distinti |
 | `LOG_LEVEL` | No | `info` | Livello di log: `debug`, `info`, `warn`, `error` |
 | `STATE_FILE_PATH` | No | `./data/sync-state.json` | Percorso del file di stato |
+| `SLACK_WEBHOOK_URL` | No | — | URL webhook Slack per invio report |
+| `SLACK_BOT_TOKEN` | No | — | Bot token Slack per upload file |
+| `SLACK_CHANNEL_ID` | No | — | Channel ID Slack per upload file |
+
+> *\* Almeno una modalità auth Shopify è necessaria: `SHOPIFY_ACCESS_TOKEN` oppure `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`*
 
 ### 5.3 Espressioni cron comuni
 
 | Espressione | Significato |
 |-------------|-------------|
-| `*/15 * * * *` | Ogni 15 minuti (default) |
-| `*/5 * * * *` | Ogni 5 minuti |
+| `0 */6 * * *` | Ogni 6 ore (default) |
+| `*/15 * * * *` | Ogni 15 minuti |
 | `0 * * * *` | Ogni ora (al minuto 0) |
 | `0 */2 * * *` | Ogni 2 ore |
 | `0 8-20 * * 1-5` | Ogni ora dalle 8 alle 20, lun-ven |
@@ -366,22 +393,51 @@ Il file viene creato automaticamente nella cartella `data/` e contiene:
 |----------|----------|
 | `Missing required environment variable` | Verificare che il file `.env` esista e contenga tutte le variabili obbligatorie |
 | `Poleepo auth failed (401)` | Verificare `POLEEPO_API_KEY` e `POLEEPO_API_SECRET` |
-| `Shopify auth failed (401)` | Verificare `SHOPIFY_CLIENT_ID` e `SHOPIFY_CLIENT_SECRET` |
+| `Shopify auth failed (400) app_not_installed` | L'app Shopify non è installata sullo store. Verificare le credenziali (`CLIENT_ID`/`CLIENT_SECRET`) |
+| `Shopify auth failed (401)` | Verificare `SHOPIFY_CLIENT_ID` e `SHOPIFY_CLIENT_SECRET` oppure `SHOPIFY_ACCESS_TOKEN` |
 | `No product mappings found` | Verificare che i prodotti siano pubblicati su Shopify tramite Poleepo |
+| `Slack invalid_blocks (400)` | I messaggi di errore contenevano HTML > 3000 caratteri. Risolto con sanitizzazione automatica |
 | `Sync already in progress, skipping` | Normale se il ciclo precedente è ancora in corso. Se persiste, controllare la connettività |
 | Il servizio non si avvia | Verificare che Node.js >= 18 sia installato (`node --version`) |
 | Tag non sincronizzati | Impostare `LOG_LEVEL=debug` e verificare che il prodotto abbia una pubblicazione SHOPIFY su Poleepo |
 
 ---
 
-## 11. Limitazioni note
+## 11. Notifiche Slack
+
+Il servizio può inviare report su Slack dopo ogni sincronizzazione.
+
+### 11.1 Configurazione
+
+- **`SLACK_WEBHOOK_URL`**: URL del webhook Slack (Incoming Webhook) — per inviare il report con Block Kit
+- **`SLACK_BOT_TOKEN`** + **`SLACK_CHANNEL_ID`**: per upload file CSV (opzionale)
+
+### 11.2 Contenuto del report
+
+Il report Slack include:
+- Stato (completato / con errori)
+- Tipo sync (full / incrementale) e durata
+- Riepilogo: prodotti mappati, analizzati, modificati, errori
+- Dettaglio prodotti modificati (max 15) con tag aggiunti e direzione
+- Dettaglio errori (max 10) con HTML sanitizzato
+
+### 11.3 Protezioni
+
+- I messaggi HTML nelle risposte di errore vengono ripuliti (tag HTML rimossi, spazi collassati)
+- Ogni errore è troncato a 200 caratteri
+- Ogni blocco Slack è limitato a 3000 caratteri (limite Block Kit)
+
+---
+
+## 12. Limitazioni note
 
 - Il servizio sincronizza solo i **tag** dei prodotti, non altri campi
 - I tag vengono **uniti** (merge): se si vuole rimuovere un tag, va fatto manualmente su entrambe le piattaforme
 - La mappatura prodotti dipende dalle **pubblicazioni Poleepo**: un prodotto Poleepo senza pubblicazione SHOPIFY non viene sincronizzato
 - L'API Poleepo non supporta un filtro `updated_since`, quindi tutti i prodotti vengono scaricati ad ogni ciclo (il confronto hash evita aggiornamenti non necessari)
+- I prodotti eliminati da Shopify vengono rilevati durante il sync incrementale (errore 404) e rimossi dallo stato automaticamente
 
 ---
 
-*Documento generato il 16 febbraio 2026*
-*Progetto: poleepo-shopify-sync v1.0.0*
+*Documento aggiornato il 20 febbraio 2026*
+*Progetto: poleepo-shopify-sync v1.1.0*
