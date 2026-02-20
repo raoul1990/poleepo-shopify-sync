@@ -19,8 +19,9 @@ export const config = {
   },
   shopify: {
     store: required('SHOPIFY_STORE'),
-    clientId: required('SHOPIFY_CLIENT_ID'),
-    clientSecret: required('SHOPIFY_CLIENT_SECRET'),
+    accessToken: process.env.SHOPIFY_ACCESS_TOKEN || '',
+    clientId: process.env.SHOPIFY_CLIENT_ID || '',
+    clientSecret: process.env.SHOPIFY_CLIENT_SECRET || '',
     apiVersion: process.env.SHOPIFY_API_VERSION || '2025-07',
   },
   sync: {

@@ -5,7 +5,7 @@ import { withRetry } from '../utils/retry';
 
 interface TokenData {
   accessToken: string;
-  expiresAt: number; // epoch ms
+  expiresAt: number; // epoch ms — Infinity for static tokens
 }
 
 export interface ShopifyProduct {
@@ -28,10 +28,25 @@ export class ShopifyClient {
     this.baseUrl = `https://${config.shopify.store}/admin/api/${config.shopify.apiVersion}`;
     // Shopify bucket leak: 2 req/sec, bucket size 40
     this.rateLimiter = new RateLimiter(40, 2);
+
+    // If a static access token is provided, use it immediately
+    if (config.shopify.accessToken) {
+      this.token = {
+        accessToken: config.shopify.accessToken,
+        expiresAt: Infinity,
+      };
+      logger.info('Shopify: using static access token from SHOPIFY_ACCESS_TOKEN');
+    }
   }
 
-  private async authenticate(): Promise<void> {
-    logger.debug('Authenticating with Shopify...');
+  private async authenticateClientCredentials(): Promise<void> {
+    if (!config.shopify.clientId || !config.shopify.clientSecret) {
+      throw new Error(
+        'Shopify auth failed: neither SHOPIFY_ACCESS_TOKEN nor SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET are configured'
+      );
+    }
+
+    logger.debug('Authenticating with Shopify via client_credentials...');
     const tokenUrl = `https://${config.shopify.store}/admin/oauth/access_token`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -52,7 +67,8 @@ export class ShopifyClient {
 
       if (!res.ok) {
         const text = await res.text();
-        throw new Error(`Shopify auth failed (${res.status}): ${text}`);
+        const clean = text.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+        throw new Error(`Shopify auth failed (${res.status}): ${clean.substring(0, 300)}`);
       }
 
       const json = await res.json() as { access_token: string; expires_in: number };
@@ -60,7 +76,7 @@ export class ShopifyClient {
         accessToken: json.access_token,
         expiresAt: Date.now() + json.expires_in * 1000,
       };
-      logger.info('Shopify authentication successful');
+      logger.info(`Shopify authentication successful (expires in ${json.expires_in}s)`);
     } finally {
       clearTimeout(timeout);
     }
@@ -68,12 +84,14 @@ export class ShopifyClient {
 
   private isTokenValid(): boolean {
     if (!this.token) return false;
+    // Static tokens (Infinity) are always valid until a 401 proves otherwise
+    if (this.token.expiresAt === Infinity) return true;
     return Date.now() < this.token.expiresAt - TOKEN_REFRESH_MARGIN_MS;
   }
 
   private async ensureToken(): Promise<string> {
     if (!this.isTokenValid()) {
-      await this.authenticate();
+      await this.authenticateClientCredentials();
     }
     return this.token!.accessToken;
   }
@@ -103,8 +121,13 @@ export class ShopifyClient {
       const res = await fetch(url, options);
 
       if (res.status === 401) {
-        logger.warn('Shopify token expired, re-authenticating...');
-        await this.authenticate();
+        logger.warn('Shopify token expired or revoked, re-authenticating...');
+        // Invalidate current token
+        this.token = null;
+
+        // If we had a static token, it's no longer valid — try client_credentials
+        await this.authenticateClientCredentials();
+
         const newToken = this.token!.accessToken;
         await this.rateLimiter.acquire();
         const retryController = new AbortController();

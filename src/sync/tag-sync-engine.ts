@@ -234,6 +234,11 @@ export class TagSyncEngine {
           shopifyProduct = resp.product;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          if (message.includes('(404)')) {
+            logger.debug(`Shopify product ${shopifyId} no longer exists (deleted), skipping`);
+            delete state.products[`poleepo_${poleepoId}`];
+            continue;
+          }
           logger.error(`Failed to fetch Shopify product ${shopifyId}: ${message}`);
           result.errors++;
           result.errorDetails.push(`Fetch Shopify product ${shopifyId}: ${message}`);

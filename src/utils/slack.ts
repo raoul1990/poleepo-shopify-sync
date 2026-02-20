@@ -97,7 +97,7 @@ function buildSlackBlocks(report: SyncReportData): object[] {
 
       blocks.push({
         type: 'section',
-        text: { type: 'mrkdwn', text: detail },
+        text: { type: 'mrkdwn', text: detail.length > 3000 ? detail.substring(0, 2997) + '...' : detail },
       });
     }
 
@@ -117,16 +117,20 @@ function buildSlackBlocks(report: SyncReportData): object[] {
   // Error details
   if (report.errorDetails.length > 0) {
     blocks.push({ type: 'divider' });
+    const errorLines = report.errorDetails
+      .slice(0, 10)
+      .map((e) => {
+        // Strip HTML and truncate long error messages
+        const clean = e.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+        return `• ${clean.length > 200 ? clean.substring(0, 200) + '...' : clean}`;
+      })
+      .join('\n');
+    const errorText = `*:x: Errori (${report.errorDetails.length}):*\n${errorLines}`;
     blocks.push({
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text:
-          `*:x: Errori (${report.errorDetails.length}):*\n` +
-          report.errorDetails
-            .slice(0, 10)
-            .map((e) => `• ${e}`)
-            .join('\n'),
+        text: errorText.length > 3000 ? errorText.substring(0, 2997) + '...' : errorText,
       },
     });
   }
