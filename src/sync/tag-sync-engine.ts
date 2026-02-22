@@ -1,11 +1,12 @@
 import { PoleepoClient, PoleepoProduct } from '../clients/poleepo';
 import { ShopifyClient, ShopifyProduct } from '../clients/shopify';
+import { PoleepoUIClient, TagAssignment, TagAssignmentResult } from '../clients/poleepo-ui';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import {
   poleepoTagsToStrings,
   shopifyTagsToStrings,
-  stringsToPoleepoFormat,
+  stringsToPoleepoFormatWithIds,
   stringsToShopifyFormat,
   computeTagHash,
   mergeTags,
@@ -30,15 +31,36 @@ export interface SyncResult {
   totalMappings: number;
   productDetails: ProductSyncDetail[];
   errorDetails: string[];
+  browserAssignResults?: TagAssignmentResult[];
 }
 
 export class TagSyncEngine {
   private readonly poleepo: PoleepoClient;
   private readonly shopify: ShopifyClient;
+  private tagIdLookup: Map<string, { id: number; value: string }> = new Map();
 
   constructor(poleepo: PoleepoClient, shopify: ShopifyClient) {
     this.poleepo = poleepo;
     this.shopify = shopify;
+  }
+
+  /**
+   * Build a case-insensitive lookup of tag value -> {id, value} from all Poleepo products.
+   * Poleepo requires tag IDs for reliable acceptance when adding tags to products.
+   */
+  private buildTagIdLookup(poleepoProducts: PoleepoProduct[]): void {
+    this.tagIdLookup.clear();
+    for (const product of poleepoProducts) {
+      for (const tag of product.tags || []) {
+        if (tag.id && tag.value) {
+          const key = tag.value.trim().toLowerCase();
+          if (!this.tagIdLookup.has(key)) {
+            this.tagIdLookup.set(key, { id: tag.id, value: tag.value });
+          }
+        }
+      }
+    }
+    logger.info(`Tag ID lookup built: ${this.tagIdLookup.size} unique tags with IDs`);
   }
 
   async run(): Promise<SyncResult> {
@@ -66,6 +88,9 @@ export class TagSyncEngine {
     for (const p of poleepoProducts) {
       poleepoMap.set(p.id, p);
     }
+
+    // 1b. Build tag ID lookup for bidirectional sync
+    this.buildTagIdLookup(poleepoProducts);
 
     // 2. Build product mappings (SKU-based)
     const { mappings, publicationsMap } = await buildProductMappings(this.poleepo, poleepoProducts);
@@ -155,6 +180,9 @@ export class TagSyncEngine {
     for (const p of poleepoProducts) {
       poleepoMap.set(p.id, p);
     }
+
+    // Build tag ID lookup for bidirectional sync
+    this.buildTagIdLookup(poleepoProducts);
 
     const { publicationsMap: currentPubMap } = await buildProductMappings(this.poleepo, poleepoProducts);
     const newMappings = findNewMappings(currentPubMap, previousState.publicationsMap);
@@ -336,32 +364,57 @@ export class TagSyncEngine {
     }
 
     // Update Poleepo if its tags are different from merged
+    let actualPoleepoHash = poleepoHash;
+    let rejectedTags: string[] = [];
     if (computeTagHash(poleepoTags) !== mergedPoleepoHash) {
+      const tagsPayload = stringsToPoleepoFormatWithIds(merged, this.tagIdLookup);
+      const withId = tagsPayload.filter((t) => t.id !== undefined).length;
+      const withoutId = tagsPayload.filter((t) => t.id === undefined).length;
       logger.info(
         `Updating Poleepo product ${poleepoId}: ` +
-        `${poleepoTags.length} tags -> ${merged.length} tags`
+        `${poleepoTags.length} tags -> ${merged.length} tags (${withId} with ID, ${withoutId} without ID)`
       );
-      await this.poleepo.updateProduct(poleepoId, { tags: stringsToPoleepoFormat(merged) });
-      updatedPoleepo = true;
+      if (withoutId > 0) {
+        const noIdTags = tagsPayload.filter((t) => t.id === undefined).map((t) => t.value);
+        logger.warn(`Tags without ID for product ${poleepoId}: [${noIdTags.join(', ')}]`);
+      }
+      await this.poleepo.updateProduct(poleepoId, { tags: tagsPayload });
+
+      // Verify: re-fetch to check which tags Poleepo actually accepted
+      const verifyResponse = await this.poleepo.getProduct(poleepoId);
+      const actualTags = poleepoTagsToStrings(verifyResponse.data.tags || []);
+      actualPoleepoHash = computeTagHash(actualTags);
+
+      if (actualPoleepoHash !== mergedPoleepoHash) {
+        const actualNorm = new Set(
+          actualTags.map((t) => config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase())
+        );
+        rejectedTags = merged.filter((t) => {
+          const key = config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase();
+          return !actualNorm.has(key);
+        });
+        if (rejectedTags.length > 0) {
+          logger.warn(
+            `Poleepo product ${poleepoId}: rejected ${rejectedTags.length} tags: [${rejectedTags.join(', ')}]`
+          );
+        }
+        updatedPoleepo = actualTags.length > poleepoTags.length;
+      } else {
+        updatedPoleepo = true;
+      }
     }
 
     // Compute tags added for the report
-    const existingNormalized = new Set(
-      allTagsBefore.map((t) => config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase())
-    );
     const poleepoNormalized = new Set(
       poleepoTags.map((t) => config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase())
     );
     const shopifyNormalized = new Set(
       shopifyTags.map((t) => config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase())
     );
-
-    // Tags that were added to Shopify = tags in merged but not in original Shopify
     const addedToShopify = merged.filter((t) => {
       const key = config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase();
       return !shopifyNormalized.has(key);
     });
-    // Tags that were added to Poleepo = tags in merged but not in original Poleepo
     const addedToPoleepo = merged.filter((t) => {
       const key = config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase();
       return !poleepoNormalized.has(key);
@@ -380,12 +433,13 @@ export class TagSyncEngine {
       tagsBefore: updatedShopify ? shopifyTags : poleepoTags,
       tagsAfter: merged,
       tagsAdded: [...new Set([...addedToShopify, ...addedToPoleepo])],
+      rejectedByPoleepo: rejectedTags.length > 0 ? rejectedTags : undefined,
     };
 
     return {
       productState: {
         shopifyId,
-        poleepoTagHash: mergedPoleepoHash,
+        poleepoTagHash: actualPoleepoHash,
         shopifyTagHash: mergedPoleepoHash,
         lastSynced: new Date().toISOString(),
       },
@@ -393,5 +447,81 @@ export class TagSyncEngine {
       updatedPoleepo,
       detail,
     };
+  }
+
+  /**
+   * Collect rejected tags from sync results, grouped by tag name with product IDs.
+   * Returns assignments suitable for PoleepoUIClient.bulkAssignTags().
+   */
+  static collectRejectedTags(result: SyncResult): TagAssignment[] {
+    const byTag = new Map<string, number[]>();
+
+    for (const detail of result.productDetails) {
+      if (detail.rejectedByPoleepo && detail.rejectedByPoleepo.length > 0) {
+        for (const tag of detail.rejectedByPoleepo) {
+          if (!byTag.has(tag)) byTag.set(tag, []);
+          byTag.get(tag)!.push(detail.poleepoId);
+        }
+      }
+    }
+
+    return [...byTag.entries()].map(([tagName, poleepoProductIds]) => ({
+      tagName,
+      poleepoProductIds,
+    }));
+  }
+
+  /**
+   * Attempt to assign rejected tags via browser automation (internal web API).
+   * Called after API-based sync when tags were rejected.
+   */
+  static async assignRejectedTagsViaBrowser(
+    result: SyncResult
+  ): Promise<TagAssignmentResult[]> {
+    const assignments = TagSyncEngine.collectRejectedTags(result);
+
+    if (assignments.length === 0) {
+      return [];
+    }
+
+    const totalProducts = assignments.reduce((sum, a) => sum + a.poleepoProductIds.length, 0);
+    logger.info(
+      `Browser fallback: ${assignments.length} rejected tags affecting ${totalProducts} products`
+    );
+
+    if (!config.poleepoWeb.username || !config.poleepoWeb.password) {
+      logger.warn(
+        'Browser fallback: POLEEPO_WEB_USERNAME/PASSWORD not configured, skipping'
+      );
+      return [];
+    }
+
+    const uiClient = new PoleepoUIClient();
+    try {
+      await uiClient.init();
+      await uiClient.login();
+      const results = await uiClient.bulkAssignTags(assignments);
+
+      for (const r of results) {
+        if (r.success) {
+          logger.info(`Browser fallback: tag "${r.tagName}" assigned to ${r.productCount} products`);
+        } else {
+          logger.error(`Browser fallback: tag "${r.tagName}" failed: ${r.message}`);
+        }
+      }
+
+      return results;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error(`Browser fallback failed: ${msg}`);
+      return [{
+        tagName: '*',
+        productCount: 0,
+        success: false,
+        message: `Browser fallback initialization failed: ${msg}`,
+      }];
+    } finally {
+      await uiClient.close();
+    }
   }
 }

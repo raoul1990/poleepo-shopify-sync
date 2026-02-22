@@ -26,6 +26,16 @@ async function runSync(): Promise<void> {
 
   try {
     const result: SyncResult = await engine.run();
+
+    // Browser fallback: assign rejected tags via internal web API
+    const rejectedAssignments = TagSyncEngine.collectRejectedTags(result);
+    if (rejectedAssignments.length > 0) {
+      logger.info(
+        `${rejectedAssignments.length} tags rejected by Poleepo API, attempting browser fallback...`
+      );
+      result.browserAssignResults = await TagSyncEngine.assignRejectedTagsViaBrowser(result);
+    }
+
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
     logger.info(
@@ -33,6 +43,13 @@ async function runSync(): Promise<void> {
       `(${result.toShopify} →Shopify, ${result.toPoleepo} →Poleepo), ` +
       `${result.errors} errori, durata ${duration}s`
     );
+
+    // Build browser fallback summary for Slack
+    const browserSummary = result.browserAssignResults?.length
+      ? result.browserAssignResults
+          .map((r) => `[${r.success ? 'OK' : 'FAIL'}] ${r.tagName}: ${r.productCount} products`)
+          .join('\n')
+      : undefined;
 
     await sendSlackReport({
       syncType: result.syncType,
@@ -45,6 +62,7 @@ async function runSync(): Promise<void> {
       totalMappings: result.totalMappings,
       productDetails: result.productDetails,
       errorDetails: result.errorDetails,
+      browserFallbackSummary: browserSummary,
     });
   } catch (error) {
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);

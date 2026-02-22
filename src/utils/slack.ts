@@ -14,6 +14,7 @@ export interface SyncReportData {
   totalMappings: number;
   productDetails: ProductSyncDetail[];
   errorDetails: string[];
+  browserFallbackSummary?: string;
 }
 
 export interface ProductSyncDetail {
@@ -24,6 +25,7 @@ export interface ProductSyncDetail {
   tagsBefore: string[];
   tagsAfter: string[];
   tagsAdded: string[];
+  rejectedByPoleepo?: string[];
 }
 
 function buildSlackBlocks(report: SyncReportData): object[] {
@@ -95,6 +97,11 @@ function buildSlackBlocks(report: SyncReportData): object[] {
         detail += `\nTag aggiunti: ${tagsStr}`;
       }
 
+      if (product.rejectedByPoleepo && product.rejectedByPoleepo.length > 0) {
+        const rejStr = product.rejectedByPoleepo.map((t) => `\`${t}\``).join(', ');
+        detail += `\n:x: Tag rifiutati da Poleepo (non in libreria): ${rejStr}`;
+      }
+
       blocks.push({
         type: 'section',
         text: { type: 'mrkdwn', text: detail.length > 3000 ? detail.substring(0, 2997) + '...' : detail },
@@ -131,6 +138,21 @@ function buildSlackBlocks(report: SyncReportData): object[] {
       text: {
         type: 'mrkdwn',
         text: errorText.length > 3000 ? errorText.substring(0, 2997) + '...' : errorText,
+      },
+    });
+  }
+
+  // Browser fallback results
+  if (report.browserFallbackSummary) {
+    blocks.push({ type: 'divider' });
+    const fbText =
+      `*:globe_with_meridians: Browser Fallback (tag rifiutati da API, assegnati via UI):*\n` +
+      `\`\`\`${report.browserFallbackSummary}\`\`\``;
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: fbText.length > 3000 ? fbText.substring(0, 2997) + '...' : fbText,
       },
     });
   }

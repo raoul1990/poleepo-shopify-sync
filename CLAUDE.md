@@ -44,11 +44,16 @@ Supporta due modalità (mutualmente esclusive):
 
 ### Autenticazione Poleepo (`src/clients/poleepo.ts`)
 
-- **Endpoint**: `POST /auth/token` con `{ api_key, api_secret }`
-- Token ~1h, refresh automatico prima della scadenza
+- **Endpoint**: `POST /oauth/access_token` con `{ client_id, client_secret, grant: 'client_credentials' }`
+- API restituisce `{ data: { access_token, duration } }` — il campo è `duration` (secondi), NON `expires_in`
+- Token ~1h, refresh automatico 5min prima della scadenza
 
 ### Tag Sync Engine (`src/sync/tag-sync-engine.ts`)
 
+- **Sync bidirezionale** con tag ID lookup: i tag vengono inviati a Poleepo con `{id, value}` per massimizzare l'accettazione
+- **Tag ID lookup**: costruito all'avvio di ogni sync scandendo tutti i prodotti Poleepo (case-insensitive)
+- **Verifica post-update**: dopo ogni aggiornamento Poleepo, ri-fetch per verificare quali tag sono stati accettati
+- **Tag rifiutati**: loggati come warning e riportati nel report Slack
 - **Full sync**: prima esecuzione — scarica tutti i prodotti da entrambe le piattaforme, merge tag, salva stato
 - **Incremental sync**: esecuzioni successive — sincronizza solo prodotti modificati (Shopify `updated_at_min` + Poleepo hash comparison)
 - **Merge non distruttivo**: i tag vengono solo aggiunti (unione), mai rimossi

@@ -34,4 +34,9 @@ export const config = {
   slackWebhookUrl: process.env.SLACK_WEBHOOK_URL || '',
   slackBotToken: process.env.SLACK_BOT_TOKEN || '',
   slackChannelId: process.env.SLACK_CHANNEL_ID || '',
+  poleepoWeb: {
+    username: process.env.POLEEPO_WEB_USERNAME || '',
+    password: process.env.POLEEPO_WEB_PASSWORD || '',
+    baseUrl: 'https://app.poleepo.cloud',
+  },
 };

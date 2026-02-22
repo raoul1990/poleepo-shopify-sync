@@ -64,10 +64,10 @@ export class PoleepoClient {
       throw new Error(`Poleepo auth failed (${res.status}): ${text}`);
     }
 
-    const json = await res.json() as { data: { access_token: string; expires_in: number } };
+    const json = await res.json() as { data: { access_token: string; duration: number } };
     this.token = {
       accessToken: json.data.access_token,
-      expiresAt: Date.now() + json.data.expires_in * 1000,
+      expiresAt: Date.now() + json.data.duration * 1000,
     };
     logger.info('Poleepo authentication successful');
     } finally {
@@ -182,7 +182,7 @@ export class PoleepoClient {
     );
   }
 
-  async updateProduct(id: number, data: { tags: { value: string }[] }): Promise<{ data: PoleepoProduct }> {
+  async updateProduct(id: number, data: { tags: { id?: number; value: string }[] }): Promise<{ data: PoleepoProduct }> {
     return withRetry(() =>
       this.request<{ data: PoleepoProduct }>('PUT', `/products/${id}`, data)
     );

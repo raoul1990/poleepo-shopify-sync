@@ -15,6 +15,25 @@ export function stringsToPoleepoFormat(values: string[]): { value: string }[] {
   return values.map((v) => ({ value: v }));
 }
 
+/**
+ * Convert tag strings to Poleepo format using known tag IDs.
+ * Tags with known IDs are sent as {id, value} for reliable acceptance.
+ * Tags without IDs are sent as {value} only (may be rejected by Poleepo).
+ */
+export function stringsToPoleepoFormatWithIds(
+  values: string[],
+  tagIdLookup: Map<string, { id: number; value: string }>
+): { id?: number; value: string }[] {
+  return values.map((v) => {
+    const key = v.trim().toLowerCase();
+    const known = tagIdLookup.get(key);
+    if (known) {
+      return { id: known.id, value: known.value };
+    }
+    return { value: v };
+  });
+}
+
 export function stringsToShopifyFormat(values: string[]): string {
   return values.join(', ');
 }
