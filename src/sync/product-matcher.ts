@@ -27,10 +27,16 @@ export async function buildProductMappings(
   }
   logger.info(`Found ${pubSkuMap.size} Shopify publications with SKU`);
 
-  // Build SKU -> Poleepo product ID map
+  // Build SKU -> Poleepo product ID map (warn on duplicates)
   const productSkuMap = new Map<string, number>();
   for (const product of poleepoProducts) {
     if (product.sku) {
+      const existing = productSkuMap.get(product.sku);
+      if (existing) {
+        logger.warn(
+          `Duplicate SKU "${product.sku}": Poleepo product ${product.id} conflicts with ${existing} — using ${product.id}`
+        );
+      }
       productSkuMap.set(product.sku, product.id);
     }
   }

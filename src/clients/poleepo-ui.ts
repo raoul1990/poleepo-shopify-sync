@@ -19,6 +19,7 @@ export interface TagAssignmentResult {
 
 const BATCH_SIZE = 200; // Max products per bulk assign request
 const INTER_TAG_DELAY_MS = 30_000; // Wait between tag assignments for async processing
+const BROWSER_TIMEOUT_MS = 5 * 60 * 1000; // 5 min global timeout for browser operations
 
 export class PoleepoUIClient {
   private browser: Browser | null = null;
@@ -33,9 +34,11 @@ export class PoleepoUIClient {
     this.browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      timeout: BROWSER_TIMEOUT_MS,
     });
     this.context = await this.browser.newContext();
     this.page = await this.context.newPage();
+    this.page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
   }
 
   async login(): Promise<void> {

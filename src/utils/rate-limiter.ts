@@ -24,9 +24,10 @@ export class RateLimiter {
       this.tokens -= 1;
       return;
     }
-    const waitTime = ((1 - this.tokens) / this.refillRate) * 1000;
+    const deficit = 1 - this.tokens;
+    const waitTime = (deficit / this.refillRate) * 1000;
     await new Promise((resolve) => setTimeout(resolve, Math.ceil(waitTime)));
     this.refill();
-    this.tokens -= 1;
+    this.tokens = Math.max(0, this.tokens - 1);
   }
 }

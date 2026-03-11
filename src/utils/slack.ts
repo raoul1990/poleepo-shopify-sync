@@ -3,6 +3,11 @@ import * as path from 'path';
 import { config } from '../config';
 import { logger } from './logger';
 
+const MAX_DISPLAY_PRODUCTS = 15;
+const MAX_DISPLAY_ERRORS = 10;
+const SLACK_BLOCK_CHAR_LIMIT = 3000;
+const ERROR_TRUNCATE_LENGTH = 200;
+
 export interface SyncReportData {
   syncType: 'full' | 'incremental';
   analyzed: number;
@@ -28,12 +33,25 @@ export interface ProductSyncDetail {
   rejectedByPoleepo?: string[];
 }
 
-function buildSlackBlocks(report: SyncReportData): object[] {
+function truncateBlock(text: string): string {
+  return text.length > SLACK_BLOCK_CHAR_LIMIT
+    ? text.substring(0, SLACK_BLOCK_CHAR_LIMIT - 3) + '...'
+    : text;
+}
+
+function sanitizeError(error: string): string {
+  const clean = error.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+  return clean.length > ERROR_TRUNCATE_LENGTH
+    ? clean.substring(0, ERROR_TRUNCATE_LENGTH) + '...'
+    : clean;
+}
+
+function buildHeaderBlocks(report: SyncReportData): object[] {
   const statusEmoji = report.errors > 0 ? ':warning:' : ':white_check_mark:';
   const statusText = report.errors > 0 ? 'Completato con errori' : 'Completato';
   const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
-  const blocks: object[] = [
+  return [
     {
       type: 'header',
       text: {
@@ -66,101 +84,107 @@ function buildSlackBlocks(report: SyncReportData): object[] {
       },
     },
   ];
+}
 
-  // Product details (max 15 to avoid Slack message limits)
-  if (report.productDetails.length > 0) {
-    blocks.push({ type: 'divider' });
-    blocks.push({
+function buildProductDetailBlocks(details: ProductSyncDetail[]): object[] {
+  if (details.length === 0) return [];
+
+  const blocks: object[] = [
+    { type: 'divider' },
+    {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*Dettaglio prodotti modificati (${report.productDetails.length}):*`,
+        text: `*Dettaglio prodotti modificati (${details.length}):*`,
       },
-    });
+    },
+  ];
 
-    const displayProducts = report.productDetails.slice(0, 15);
-    for (const product of displayProducts) {
-      const directionLabel =
-        product.direction === 'both'
-          ? ':arrows_counterclockwise: Entrambi'
-          : product.direction === 'shopify'
-          ? ':arrow_right: → Shopify'
-          : ':arrow_left: → Poleepo';
+  const displayProducts = details.slice(0, MAX_DISPLAY_PRODUCTS);
+  for (const product of displayProducts) {
+    const directionLabel =
+      product.direction === 'both'
+        ? ':arrows_counterclockwise: Entrambi'
+        : product.direction === 'shopify'
+        ? ':arrow_right: → Shopify'
+        : ':arrow_left: → Poleepo';
 
-      let detail =
-        `*${product.productName || `Poleepo #${product.poleepoId}`}*\n` +
-        `Poleepo ID: \`${product.poleepoId}\` | Shopify ID: \`${product.shopifyId}\`\n` +
-        `Direzione: ${directionLabel}`;
+    let detail =
+      `*${product.productName || `Poleepo #${product.poleepoId}`}*\n` +
+      `Poleepo ID: \`${product.poleepoId}\` | Shopify ID: \`${product.shopifyId}\`\n` +
+      `Direzione: ${directionLabel}`;
 
-      if (product.tagsAdded.length > 0) {
-        const tagsStr = product.tagsAdded.map((t) => `\`${t}\``).join(', ');
-        detail += `\nTag aggiunti: ${tagsStr}`;
-      }
-
-      if (product.rejectedByPoleepo && product.rejectedByPoleepo.length > 0) {
-        const rejStr = product.rejectedByPoleepo.map((t) => `\`${t}\``).join(', ');
-        detail += `\n:x: Tag rifiutati da Poleepo (non in libreria): ${rejStr}`;
-      }
-
-      blocks.push({
-        type: 'section',
-        text: { type: 'mrkdwn', text: detail.length > 3000 ? detail.substring(0, 2997) + '...' : detail },
-      });
+    if (product.tagsAdded.length > 0) {
+      const tagsStr = product.tagsAdded.map((t) => `\`${t}\``).join(', ');
+      detail += `\nTag aggiunti: ${tagsStr}`;
     }
 
-    if (report.productDetails.length > 15) {
-      blocks.push({
-        type: 'context',
-        elements: [
-          {
-            type: 'mrkdwn',
-            text: `_...e altri ${report.productDetails.length - 15} prodotti non mostrati_`,
-          },
-        ],
-      });
+    if (product.rejectedByPoleepo && product.rejectedByPoleepo.length > 0) {
+      const rejStr = product.rejectedByPoleepo.map((t) => `\`${t}\``).join(', ');
+      detail += `\n:x: Tag rifiutati da Poleepo (non in libreria): ${rejStr}`;
     }
-  }
 
-  // Error details
-  if (report.errorDetails.length > 0) {
-    blocks.push({ type: 'divider' });
-    const errorLines = report.errorDetails
-      .slice(0, 10)
-      .map((e) => {
-        // Strip HTML and truncate long error messages
-        const clean = e.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
-        return `• ${clean.length > 200 ? clean.substring(0, 200) + '...' : clean}`;
-      })
-      .join('\n');
-    const errorText = `*:x: Errori (${report.errorDetails.length}):*\n${errorLines}`;
     blocks.push({
       type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: errorText.length > 3000 ? errorText.substring(0, 2997) + '...' : errorText,
-      },
+      text: { type: 'mrkdwn', text: truncateBlock(detail) },
     });
   }
 
-  // Browser fallback results
-  if (report.browserFallbackSummary) {
-    blocks.push({ type: 'divider' });
-    const fbText =
-      `*:globe_with_meridians: Browser Fallback (tag rifiutati da API, assegnati via UI):*\n` +
-      `\`\`\`${report.browserFallbackSummary}\`\`\``;
+  if (details.length > MAX_DISPLAY_PRODUCTS) {
     blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: fbText.length > 3000 ? fbText.substring(0, 2997) + '...' : fbText,
-      },
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `_...e altri ${details.length - MAX_DISPLAY_PRODUCTS} prodotti non mostrati_`,
+        },
+      ],
     });
   }
 
-  // No changes
-  if (report.modified === 0 && report.errors === 0) {
-    blocks.push({ type: 'divider' });
-    blocks.push({
+  return blocks;
+}
+
+function buildErrorBlocks(errorDetails: string[]): object[] {
+  if (errorDetails.length === 0) return [];
+
+  const errorLines = errorDetails
+    .slice(0, MAX_DISPLAY_ERRORS)
+    .map((e) => `• ${sanitizeError(e)}`)
+    .join('\n');
+  const errorText = `*:x: Errori (${errorDetails.length}):*\n${errorLines}`;
+
+  return [
+    { type: 'divider' },
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: truncateBlock(errorText) },
+    },
+  ];
+}
+
+function buildBrowserFallbackBlocks(summary?: string): object[] {
+  if (!summary) return [];
+
+  const fbText =
+    `*:globe_with_meridians: Browser Fallback (tag rifiutati da API, assegnati via UI):*\n` +
+    `\`\`\`${summary}\`\`\``;
+
+  return [
+    { type: 'divider' },
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: truncateBlock(fbText) },
+    },
+  ];
+}
+
+function buildNoChangesBlocks(report: SyncReportData): object[] {
+  if (report.modified > 0 || report.errors > 0) return [];
+
+  return [
+    { type: 'divider' },
+    {
       type: 'context',
       elements: [
         {
@@ -168,10 +192,18 @@ function buildSlackBlocks(report: SyncReportData): object[] {
           text: ':zzz: _Nessuna modifica necessaria — tutti i tag sono già sincronizzati._',
         },
       ],
-    });
-  }
+    },
+  ];
+}
 
-  return blocks;
+function buildSlackBlocks(report: SyncReportData): object[] {
+  return [
+    ...buildHeaderBlocks(report),
+    ...buildProductDetailBlocks(report.productDetails),
+    ...buildErrorBlocks(report.errorDetails),
+    ...buildBrowserFallbackBlocks(report.browserFallbackSummary),
+    ...buildNoChangesBlocks(report),
+  ];
 }
 
 export async function sendSlackReport(report: SyncReportData): Promise<void> {

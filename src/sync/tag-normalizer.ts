@@ -2,6 +2,13 @@ import * as crypto from 'crypto';
 import { config } from '../config';
 import { PoleepoTag } from '../clients/poleepo';
 
+/**
+ * Normalize a single tag value: trim + optional lowercase.
+ */
+export function normalizeTag(tag: string): string {
+  return config.sync.tagCaseSensitive ? tag.trim() : tag.trim().toLowerCase();
+}
+
 export function poleepoTagsToStrings(tags: PoleepoTag[]): string[] {
   return tags.map((t) => t.value);
 }
@@ -39,9 +46,7 @@ export function stringsToShopifyFormat(values: string[]): string {
 }
 
 export function computeTagHash(tags: string[]): string {
-  const normalized = tags
-    .map((t) => (config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase()))
-    .sort();
+  const normalized = tags.map(normalizeTag).sort();
   return crypto.createHash('md5').update(normalized.join('|')).digest('hex');
 }
 
@@ -53,7 +58,7 @@ export function mergeTags(tagsA: string[], tagsB: string[]): string[] {
   const seen = new Map<string, string>(); // normalized -> original
 
   for (const tag of [...tagsA, ...tagsB]) {
-    const key = config.sync.tagCaseSensitive ? tag.trim() : tag.trim().toLowerCase();
+    const key = normalizeTag(tag);
     if (!seen.has(key)) {
       seen.set(key, tag.trim());
     }

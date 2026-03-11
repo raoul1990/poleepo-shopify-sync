@@ -40,3 +40,10 @@ export const config = {
     baseUrl: 'https://app.poleepo.cloud',
   },
 };
+
+// Validate Shopify auth: at least one method must be configured
+if (!config.shopify.accessToken && (!config.shopify.clientId || !config.shopify.clientSecret)) {
+  throw new Error(
+    'Shopify auth not configured: set SHOPIFY_ACCESS_TOKEN or both SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET'
+  );
+}

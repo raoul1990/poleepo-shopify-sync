@@ -29,6 +29,21 @@ export function loadState(): SyncState | null {
     }
     const raw = fs.readFileSync(filePath, 'utf-8');
     const state = JSON.parse(raw) as SyncState;
+
+    // Validate required fields
+    if (!state.lastSyncTime || typeof state.lastSyncTime !== 'string') {
+      logger.warn('Invalid sync state: missing lastSyncTime. Will perform full sync.');
+      return null;
+    }
+    if (!state.products || typeof state.products !== 'object') {
+      logger.warn('Invalid sync state: missing products map. Will perform full sync.');
+      return null;
+    }
+    if (!state.publicationsMap || typeof state.publicationsMap !== 'object') {
+      logger.warn('Invalid sync state: missing publicationsMap. Will perform full sync.');
+      return null;
+    }
+
     logger.info(`Loaded sync state from ${filePath} (last sync: ${state.lastSyncTime})`);
     return state;
   } catch (error) {

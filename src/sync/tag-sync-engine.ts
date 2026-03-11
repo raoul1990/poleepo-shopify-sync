@@ -4,6 +4,7 @@ import { PoleepoUIClient, TagAssignment, TagAssignmentResult } from '../clients/
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import {
+  normalizeTag,
   poleepoTagsToStrings,
   shopifyTagsToStrings,
   stringsToPoleepoFormatWithIds,
@@ -137,14 +138,9 @@ export class TagSyncEngine {
 
         state.products[`poleepo_${mapping.poleepoId}`] = syncOutcome.productState;
 
-        if (syncOutcome.updatedShopify) {
-          result.toShopify++;
-          result.modified++;
-        }
-        if (syncOutcome.updatedPoleepo) {
-          result.toPoleepo++;
-          result.modified++;
-        }
+        if (syncOutcome.updatedShopify) result.toShopify++;
+        if (syncOutcome.updatedPoleepo) result.toPoleepo++;
+        if (syncOutcome.updatedShopify || syncOutcome.updatedPoleepo) result.modified++;
         if (syncOutcome.detail) {
           result.productDetails.push(syncOutcome.detail);
         }
@@ -289,14 +285,9 @@ export class TagSyncEngine {
 
         state.products[`poleepo_${poleepoId}`] = syncOutcome.productState;
 
-        if (syncOutcome.updatedShopify) {
-          result.toShopify++;
-          result.modified++;
-        }
-        if (syncOutcome.updatedPoleepo) {
-          result.toPoleepo++;
-          result.modified++;
-        }
+        if (syncOutcome.updatedShopify) result.toShopify++;
+        if (syncOutcome.updatedPoleepo) result.toPoleepo++;
+        if (syncOutcome.updatedShopify || syncOutcome.updatedPoleepo) result.modified++;
         if (syncOutcome.detail) {
           result.productDetails.push(syncOutcome.detail);
         }
@@ -349,12 +340,11 @@ export class TagSyncEngine {
     }
 
     // Merge tags (union of both sets)
-    const allTagsBefore = [...new Set([...poleepoTags, ...shopifyTags])];
     const merged = mergeTags(poleepoTags, shopifyTags);
-    const mergedPoleepoHash = computeTagHash(merged);
+    const mergedHash = computeTagHash(merged);
 
     // Update Shopify if its tags are different from merged
-    if (computeTagHash(shopifyTags) !== mergedPoleepoHash) {
+    if (shopifyHash !== mergedHash) {
       logger.info(
         `Updating Shopify product ${shopifyId}: ` +
         `${shopifyTags.length} tags -> ${merged.length} tags`
@@ -366,7 +356,7 @@ export class TagSyncEngine {
     // Update Poleepo if its tags are different from merged
     let actualPoleepoHash = poleepoHash;
     let rejectedTags: string[] = [];
-    if (computeTagHash(poleepoTags) !== mergedPoleepoHash) {
+    if (poleepoHash !== mergedHash) {
       const tagsPayload = stringsToPoleepoFormatWithIds(merged, this.tagIdLookup);
       const withId = tagsPayload.filter((t) => t.id !== undefined).length;
       const withoutId = tagsPayload.filter((t) => t.id === undefined).length;
@@ -385,14 +375,9 @@ export class TagSyncEngine {
       const actualTags = poleepoTagsToStrings(verifyResponse.data.tags || []);
       actualPoleepoHash = computeTagHash(actualTags);
 
-      if (actualPoleepoHash !== mergedPoleepoHash) {
-        const actualNorm = new Set(
-          actualTags.map((t) => config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase())
-        );
-        rejectedTags = merged.filter((t) => {
-          const key = config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase();
-          return !actualNorm.has(key);
-        });
+      if (actualPoleepoHash !== mergedHash) {
+        const actualNorm = new Set(actualTags.map(normalizeTag));
+        rejectedTags = merged.filter((t) => !actualNorm.has(normalizeTag(t)));
         if (rejectedTags.length > 0) {
           logger.warn(
             `Poleepo product ${poleepoId}: rejected ${rejectedTags.length} tags: [${rejectedTags.join(', ')}]`
@@ -405,20 +390,10 @@ export class TagSyncEngine {
     }
 
     // Compute tags added for the report
-    const poleepoNormalized = new Set(
-      poleepoTags.map((t) => config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase())
-    );
-    const shopifyNormalized = new Set(
-      shopifyTags.map((t) => config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase())
-    );
-    const addedToShopify = merged.filter((t) => {
-      const key = config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase();
-      return !shopifyNormalized.has(key);
-    });
-    const addedToPoleepo = merged.filter((t) => {
-      const key = config.sync.tagCaseSensitive ? t.trim() : t.trim().toLowerCase();
-      return !poleepoNormalized.has(key);
-    });
+    const poleepoNormalized = new Set(poleepoTags.map(normalizeTag));
+    const shopifyNormalized = new Set(shopifyTags.map(normalizeTag));
+    const addedToShopify = merged.filter((t) => !shopifyNormalized.has(normalizeTag(t)));
+    const addedToPoleepo = merged.filter((t) => !poleepoNormalized.has(normalizeTag(t)));
 
     const productName = poleepoProduct.title || shopifyProduct.title || '';
     const direction: 'shopify' | 'poleepo' | 'both' =
@@ -440,7 +415,7 @@ export class TagSyncEngine {
       productState: {
         shopifyId,
         poleepoTagHash: actualPoleepoHash,
-        shopifyTagHash: mergedPoleepoHash,
+        shopifyTagHash: mergedHash,
         lastSynced: new Date().toISOString(),
       },
       updatedShopify,
