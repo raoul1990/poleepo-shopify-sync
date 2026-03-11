@@ -1,4 +1,3 @@
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
@@ -20,6 +19,14 @@ export interface TagAssignmentResult {
 const BATCH_SIZE = 200; // Max products per bulk assign request
 const INTER_TAG_DELAY_MS = 30_000; // Wait between tag assignments for async processing
 const BROWSER_TIMEOUT_MS = 5 * 60 * 1000; // 5 min global timeout for browser operations
+const INTER_BATCH_DELAY_MS = 2_000; // Pause between batches within same tag
+const LOGIN_TIMEOUT_MS = 15_000;
+const PAGE_LOAD_TIMEOUT_MS = 30_000;
+
+// Lazy-loaded Playwright types (avoids loading ~100MB when browser fallback isn't needed)
+type Browser = import('playwright').Browser;
+type BrowserContext = import('playwright').BrowserContext;
+type Page = import('playwright').Page;
 
 export class PoleepoUIClient {
   private browser: Browser | null = null;
@@ -30,6 +37,9 @@ export class PoleepoUIClient {
     if (!config.poleepoWeb.username || !config.poleepoWeb.password) {
       throw new Error('POLEEPO_WEB_USERNAME and POLEEPO_WEB_PASSWORD must be set');
     }
+
+    // Lazy import: Playwright is only loaded when browser fallback is actually needed
+    const { chromium } = await import('playwright');
 
     this.browser = await chromium.launch({
       headless: true,
@@ -53,7 +63,7 @@ export class PoleepoUIClient {
     await this.page.fill('input[name="password"]', config.poleepoWeb.password);
     await this.page.click('button[type="submit"]');
 
-    await this.page.waitForURL('**/app.poleepo.cloud/**', { timeout: 15000 });
+    await this.page.waitForURL('**/app.poleepo.cloud/**', { timeout: LOGIN_TIMEOUT_MS });
     await this.page.waitForLoadState('networkidle');
 
     // Verify we're logged in (not on login page)
@@ -65,9 +75,6 @@ export class PoleepoUIClient {
     logger.info('Poleepo UI: login successful');
   }
 
-  /**
-   * Navigate to product index to set up the page context for AJAX calls.
-   */
   private async ensureOnProductPage(): Promise<void> {
     if (!this.page) throw new Error('PoleepoUIClient not initialized');
 
@@ -75,14 +82,11 @@ export class PoleepoUIClient {
     if (!url.includes('/product/index')) {
       await this.page.goto(`${config.poleepoWeb.baseUrl}/product/index`, {
         waitUntil: 'networkidle',
-        timeout: 30000,
+        timeout: PAGE_LOAD_TIMEOUT_MS,
       });
     }
   }
 
-  /**
-   * Check if a tag exists in Poleepo's tag system.
-   */
   async tagExists(tagName: string): Promise<boolean> {
     await this.ensureOnProductPage();
     const results = await this.page!.evaluate(async (term: string) => {
@@ -102,9 +106,6 @@ export class PoleepoUIClient {
     );
   }
 
-  /**
-   * Get all available tags from the Poleepo UI.
-   */
   async getAvailableTags(): Promise<{ id: string; text: string }[]> {
     await this.ensureOnProductPage();
     const results = await this.page!.evaluate(async () => {
@@ -121,27 +122,16 @@ export class PoleepoUIClient {
     return results.results;
   }
 
-  /**
-   * Bulk assign a tag to a list of Poleepo product IDs.
-   * Uses the internal web API endpoint POST /product/bulkAssignTags.
-   * The endpoint processes asynchronously and sends email notification on completion.
-   */
   async bulkAssignTag(
     tagName: string,
     productIds: number[]
   ): Promise<TagAssignmentResult> {
     if (productIds.length === 0) {
-      return {
-        tagName,
-        productCount: 0,
-        success: true,
-        message: 'No products to assign',
-      };
+      return { tagName, productCount: 0, success: true, message: 'No products to assign' };
     }
 
     await this.ensureOnProductPage();
 
-    // Process in batches to avoid overloading
     let totalAssigned = 0;
     const batchCount = Math.ceil(productIds.length / BATCH_SIZE);
 
@@ -156,7 +146,6 @@ export class PoleepoUIClient {
       const result = await this.page!.evaluate(
         async (params: { tag: string; ids: number[] }) => {
           return new Promise<{ status: number; body: string }>((resolve) => {
-            // Build form data: checkProduct=id1&checkProduct=id2&...&tags=tagName
             const formData = params.ids
               .map((id) => `checkProduct=${id}`)
               .join('&');
@@ -202,9 +191,8 @@ export class PoleepoUIClient {
         `Poleepo UI: tag "${tagName}" batch ${batchNum} submitted (${totalAssigned}/${productIds.length})`
       );
 
-      // Brief pause between batches
       if (i + BATCH_SIZE < productIds.length) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, INTER_BATCH_DELAY_MS));
       }
     }
 
@@ -216,9 +204,6 @@ export class PoleepoUIClient {
     };
   }
 
-  /**
-   * Assign multiple tags to their respective product groups.
-   */
   async bulkAssignTags(
     assignments: TagAssignment[]
   ): Promise<TagAssignmentResult[]> {
@@ -227,7 +212,6 @@ export class PoleepoUIClient {
     for (let i = 0; i < assignments.length; i++) {
       const assignment = assignments[i];
 
-      // Wait between tag assignments to let Poleepo process each one
       if (i > 0) {
         logger.info(
           `Poleepo UI: waiting ${INTER_TAG_DELAY_MS / 1000}s before next tag assignment...`

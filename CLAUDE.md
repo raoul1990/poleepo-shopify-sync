@@ -11,13 +11,15 @@ poleepo-shopify-sync/
 │   ├── config.ts                # Caricamento configurazione da .env
 │   ├── clients/
 │   │   ├── poleepo.ts           # Client API Poleepo (OAuth2 + CRUD prodotti)
+│   │   ├── poleepo-ui.ts        # Browser automation (Playwright, lazy-loaded)
 │   │   └── shopify.ts           # Client API Shopify (dual auth + CRUD prodotti)
 │   ├── sync/
 │   │   ├── tag-sync-engine.ts   # Motore di sincronizzazione (full + incrementale)
 │   │   ├── product-matcher.ts   # Mapping prodotti via pubblicazioni Poleepo→Shopify
-│   │   ├── tag-normalizer.ts    # Parsing, normalizzazione, hash MD5 e merge tag
+│   │   ├── tag-normalizer.ts    # Parsing, normalizzazione, hash FNV-1a e merge tag
 │   │   └── state-manager.ts     # Gestione file di stato (sync-state.json)
 │   └── utils/
+│       ├── api-request.ts       # Fetch con timeout + retry automatico su 401
 │       ├── logger.ts            # Logger con timestamp ISO
 │       ├── rate-limiter.ts      # Token bucket (2 req/s, bucket 40)
 │       ├── retry.ts             # Retry con exponential backoff (3 tentativi)

@@ -1,4 +1,3 @@
-import * as crypto from 'crypto';
 import { config } from '../config';
 import { PoleepoTag } from '../clients/poleepo';
 
@@ -18,10 +17,6 @@ export function shopifyTagsToStrings(tags: string): string[] {
   return tags.split(',').map((t) => t.trim()).filter((t) => t.length > 0);
 }
 
-export function stringsToPoleepoFormat(values: string[]): { value: string }[] {
-  return values.map((v) => ({ value: v }));
-}
-
 /**
  * Convert tag strings to Poleepo format using known tag IDs.
  * Tags with known IDs are sent as {id, value} for reliable acceptance.
@@ -32,7 +27,7 @@ export function stringsToPoleepoFormatWithIds(
   tagIdLookup: Map<string, { id: number; value: string }>
 ): { id?: number; value: string }[] {
   return values.map((v) => {
-    const key = v.trim().toLowerCase();
+    const key = normalizeTag(v);
     const known = tagIdLookup.get(key);
     if (known) {
       return { id: known.id, value: known.value };
@@ -45,9 +40,22 @@ export function stringsToShopifyFormat(values: string[]): string {
   return values.join(', ');
 }
 
+/**
+ * Fast non-cryptographic hash for tag comparison.
+ * Uses FNV-1a 32-bit for speed — only used for change detection, not security.
+ */
+function fnv1aHash(str: string): string {
+  let hash = 0x811c9dc5; // FNV offset basis
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = (hash * 0x01000193) >>> 0; // FNV prime, keep as uint32
+  }
+  return hash.toString(36);
+}
+
 export function computeTagHash(tags: string[]): string {
   const normalized = tags.map(normalizeTag).sort();
-  return crypto.createHash('md5').update(normalized.join('|')).digest('hex');
+  return fnv1aHash(normalized.join('|'));
 }
 
 /**

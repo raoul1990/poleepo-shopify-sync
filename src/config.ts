@@ -28,6 +28,7 @@ export const config = {
     cron: process.env.SYNC_CRON || '*/15 * * * *',
     batchSize: parseInt(process.env.SYNC_BATCH_SIZE || '50', 10),
     tagCaseSensitive: process.env.TAG_CASE_SENSITIVE === 'true',
+    shutdownTimeoutMs: parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '60000', 10),
   },
   logLevel: (process.env.LOG_LEVEL || 'info') as 'debug' | 'info' | 'warn' | 'error',
   stateFilePath: process.env.STATE_FILE_PATH || './data/sync-state.json',
@@ -45,5 +46,12 @@ export const config = {
 if (!config.shopify.accessToken && (!config.shopify.clientId || !config.shopify.clientSecret)) {
   throw new Error(
     'Shopify auth not configured: set SHOPIFY_ACCESS_TOKEN or both SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET'
+  );
+}
+
+// Validate Slack webhook URL format (if configured)
+if (config.slackWebhookUrl && !config.slackWebhookUrl.startsWith('https://hooks.slack.com/')) {
+  throw new Error(
+    `Invalid SLACK_WEBHOOK_URL: must start with https://hooks.slack.com/ (got: ${config.slackWebhookUrl.substring(0, 30)}...)`
   );
 }

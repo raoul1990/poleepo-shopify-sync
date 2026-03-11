@@ -5,14 +5,6 @@
  * assigned through the web UI's "Operazioni Massive" feature, which internally
  * calls POST /product/bulkAssignTags.
  *
- * This script:
- * 1. Fetches all Poleepo and Shopify products
- * 2. Builds product mappings (SKU-based)
- * 3. Compares tags to find what's missing on Poleepo
- * 4. Groups missing tags by tag name
- * 5. Uses PoleepoUIClient to bulk-assign each tag group
- * 6. Verifies assignments via API re-fetch
- *
  * Usage:
  *   npx ts-node src/scripts/assign-tags.ts [--dry-run] [--tag PE26] [--verify]
  */
@@ -29,14 +21,17 @@ import { ShopifyClient } from '../clients/shopify';
 import { PoleepoUIClient, TagAssignment } from '../clients/poleepo-ui';
 import { buildProductMappings } from '../sync/product-matcher';
 import {
+  normalizeTag,
   poleepoTagsToStrings,
   shopifyTagsToStrings,
 } from '../sync/tag-normalizer';
 
-interface MissingTagInfo {
-  tagName: string;
-  poleepoProductIds: number[];
-  productSkus: string[]; // for logging
+const VERIFY_DELAY_MS = 30_000;
+const VERIFY_SAMPLE_SIZE = 5;
+
+interface MissingTagEntry {
+  poleepoIds: number[];
+  skus: string[];
 }
 
 // Parse CLI arguments
@@ -46,46 +41,16 @@ const verifyAfter = args.includes('--verify');
 const tagFilterIdx = args.indexOf('--tag');
 const tagFilter = tagFilterIdx >= 0 ? args[tagFilterIdx + 1] : null;
 
-async function main(): Promise<void> {
-  setLogLevel(config.logLevel);
-
-  logger.info('=== Poleepo Tag Assignment Script ===');
-  if (dryRun) logger.info('DRY RUN mode - no changes will be made');
-  if (tagFilter) logger.info(`Filtering to tag: ${tagFilter}`);
-
-  const poleepo = new PoleepoClient();
-  const shopify = new ShopifyClient();
-
-  // 1. Fetch all Poleepo products
-  logger.info('Fetching all Poleepo products...');
-  const poleepoProducts = await poleepo.getAllProducts(config.sync.batchSize);
-  logger.info(`Fetched ${poleepoProducts.length} Poleepo products`);
-
-  const poleepoMap = new Map<number, PoleepoProduct>();
-  for (const p of poleepoProducts) {
-    poleepoMap.set(p.id, p);
-  }
-
-  // 2. Build product mappings (SKU-based via publications)
-  logger.info('Building product mappings...');
-  const { mappings, publicationsMap } = await buildProductMappings(poleepo, poleepoProducts);
-  logger.info(`Found ${mappings.length} product mappings`);
-
-  // Create reverse map: shopifyId -> poleepoId
-  const shopifyToPoleepo = new Map<string, string>();
-  for (const [poleepoId, shopifyId] of Object.entries(publicationsMap)) {
-    shopifyToPoleepo.set(shopifyId, poleepoId);
-  }
-
-  // 3. Fetch all Shopify products
-  logger.info('Fetching all Shopify products...');
-  const shopifyProducts = await shopify.getAllProducts();
-  logger.info(`Fetched ${shopifyProducts.length} Shopify products`);
-
-  // 4. Compare tags and find what's missing on Poleepo
-  logger.info('Analyzing tag differences...');
-  const missingByTag = new Map<string, { poleepoIds: number[]; skus: string[] }>();
-  let totalMissing = 0;
+/**
+ * Find tags present on Shopify but missing from Poleepo.
+ */
+function findMissingTags(
+  shopifyProducts: { id: number; tags: string }[],
+  poleepoMap: Map<number, PoleepoProduct>,
+  shopifyToPoleepo: Map<string, string>,
+  filterTag: string | null
+): Map<string, MissingTagEntry> {
+  const missingByTag = new Map<string, MissingTagEntry>();
 
   for (const shopifyProduct of shopifyProducts) {
     const poleepoIdStr = shopifyToPoleepo.get(String(shopifyProduct.id));
@@ -97,35 +62,31 @@ async function main(): Promise<void> {
 
     const shopifyTags = shopifyTagsToStrings(shopifyProduct.tags || '');
     const poleepoTags = poleepoTagsToStrings(poleepoProduct.tags || []);
+    const poleepoTagsNorm = new Set(poleepoTags.map(normalizeTag));
 
-    // Normalize for comparison
-    const poleepoTagsNorm = new Set(
-      poleepoTags.map((t) => t.trim().toLowerCase())
-    );
-
-    // Find tags on Shopify that are missing from Poleepo
     for (const tag of shopifyTags) {
-      const normTag = tag.trim().toLowerCase();
-      if (!poleepoTagsNorm.has(normTag)) {
-        // Apply filter if specified
-        if (tagFilter && normTag !== tagFilter.toLowerCase()) continue;
+      if (poleepoTagsNorm.has(normalizeTag(tag))) continue;
+      if (filterTag && normalizeTag(tag) !== normalizeTag(filterTag)) continue;
 
-        if (!missingByTag.has(tag)) {
-          missingByTag.set(tag, { poleepoIds: [], skus: [] });
-        }
-        const entry = missingByTag.get(tag)!;
-        entry.poleepoIds.push(poleepoId);
-        entry.skus.push(poleepoProduct.sku || String(poleepoId));
-        totalMissing++;
+      if (!missingByTag.has(tag)) {
+        missingByTag.set(tag, { poleepoIds: [], skus: [] });
       }
+      const entry = missingByTag.get(tag)!;
+      entry.poleepoIds.push(poleepoId);
+      entry.skus.push(poleepoProduct.sku || String(poleepoId));
     }
   }
 
-  // 5. Sort by product count (most first) and display summary
-  const sortedTags = [...missingByTag.entries()]
-    .sort((a, b) => b[1].poleepoIds.length - a[1].poleepoIds.length);
+  return missingByTag;
+}
 
+/**
+ * Print a summary table of missing tags.
+ */
+function printSummary(sortedTags: [string, MissingTagEntry][]): void {
+  const totalMissing = sortedTags.reduce((sum, [, info]) => sum + info.poleepoIds.length, 0);
   logger.info(`\nFound ${totalMissing} missing tag assignments across ${sortedTags.length} tags:\n`);
+
   console.log('Tag Name               | Products | Sample SKUs');
   console.log('-----------------------|----------|------------');
   for (const [tag, info] of sortedTags) {
@@ -135,43 +96,26 @@ async function main(): Promise<void> {
     console.log(`${name}|${count} | ${skus}`);
   }
   console.log('');
+}
 
-  if (dryRun) {
-    logger.info('DRY RUN complete. No changes made.');
-    return;
-  }
-
-  if (sortedTags.length === 0) {
-    logger.info('No missing tags found. Nothing to do.');
-    return;
-  }
-
-  // 6. Use PoleepoUIClient to assign tags
+/**
+ * Execute tag assignments via browser automation.
+ */
+async function executeAssignments(
+  sortedTags: [string, MissingTagEntry][]
+): Promise<void> {
   const uiClient = new PoleepoUIClient();
 
   try {
     await uiClient.init();
     await uiClient.login();
 
-    // Build assignments - the bulk assign endpoint accepts any tag name,
-    // Poleepo will create the tag if it doesn't exist yet
-    const assignments: TagAssignment[] = [];
-
-    for (const [tag, info] of sortedTags) {
-      assignments.push({
-        tagName: tag,
-        poleepoProductIds: info.poleepoIds,
-      });
-    }
-
-    if (assignments.length === 0) {
-      logger.info('No assignable tags found.');
-      return;
-    }
+    const assignments: TagAssignment[] = sortedTags.map(([tag, info]) => ({
+      tagName: tag,
+      poleepoProductIds: info.poleepoIds,
+    }));
 
     logger.info(`\nAssigning ${assignments.length} tags to products...`);
-
-    // Execute assignments
     const results = await uiClient.bulkAssignTags(assignments);
 
     // Report results
@@ -192,10 +136,11 @@ async function main(): Promise<void> {
       `\nCompleted: ${successCount} succeeded, ${failCount} failed out of ${results.length} tags`
     );
 
-    // 7. Verify if requested
+    // Verify if requested
     if (verifyAfter) {
-      logger.info('\nVerifying tag assignments (waiting 30s for processing)...');
-      await new Promise((r) => setTimeout(r, 30000));
+      logger.info(`\nVerifying tag assignments (waiting ${VERIFY_DELAY_MS / 1000}s for processing)...`);
+      await new Promise((r) => setTimeout(r, VERIFY_DELAY_MS));
+      const poleepo = new PoleepoClient();
       await verifyAssignments(poleepo, assignments);
     }
   } finally {
@@ -211,18 +156,15 @@ async function verifyAssignments(
   let missing = 0;
 
   for (const assignment of assignments) {
-    // Sample up to 5 products for verification
-    const sampleIds = assignment.poleepoProductIds.slice(0, 5);
+    const sampleIds = assignment.poleepoProductIds.slice(0, VERIFY_SAMPLE_SIZE);
 
     for (const productId of sampleIds) {
       try {
         const response = await poleepo.getProduct(productId);
         const currentTags = poleepoTagsToStrings(response.data.tags || []);
-        const currentTagsNorm = new Set(
-          currentTags.map((t) => t.trim().toLowerCase())
-        );
+        const currentTagsNorm = new Set(currentTags.map(normalizeTag));
 
-        if (currentTagsNorm.has(assignment.tagName.toLowerCase())) {
+        if (currentTagsNorm.has(normalizeTag(assignment.tagName))) {
           verified++;
         } else {
           missing++;
@@ -230,7 +172,7 @@ async function verifyAssignments(
             `Verification: product ${productId} still missing tag "${assignment.tagName}"`
           );
         }
-      } catch (error) {
+      } catch {
         logger.error(`Verification: failed to fetch product ${productId}`);
       }
     }
@@ -247,6 +189,62 @@ async function verifyAssignments(
       'Run the script again with --verify after a few minutes.'
     );
   }
+}
+
+async function main(): Promise<void> {
+  setLogLevel(config.logLevel);
+
+  logger.info('=== Poleepo Tag Assignment Script ===');
+  if (dryRun) logger.info('DRY RUN mode - no changes will be made');
+  if (tagFilter) logger.info(`Filtering to tag: ${tagFilter}`);
+
+  const poleepo = new PoleepoClient();
+  const shopify = new ShopifyClient();
+
+  // 1. Fetch all Poleepo products
+  logger.info('Fetching all Poleepo products...');
+  const poleepoProducts = await poleepo.getAllProducts(config.sync.batchSize);
+  logger.info(`Fetched ${poleepoProducts.length} Poleepo products`);
+
+  const poleepoMap = new Map<number, PoleepoProduct>();
+  for (const p of poleepoProducts) poleepoMap.set(p.id, p);
+
+  // 2. Build product mappings
+  logger.info('Building product mappings...');
+  const { mappings, publicationsMap } = await buildProductMappings(poleepo, poleepoProducts);
+  logger.info(`Found ${mappings.length} product mappings`);
+
+  const shopifyToPoleepo = new Map<string, string>();
+  for (const [poleepoId, shopifyId] of Object.entries(publicationsMap)) {
+    shopifyToPoleepo.set(shopifyId, poleepoId);
+  }
+
+  // 3. Fetch all Shopify products
+  logger.info('Fetching all Shopify products...');
+  const shopifyProducts = await shopify.getAllProducts();
+  logger.info(`Fetched ${shopifyProducts.length} Shopify products`);
+
+  // 4. Find missing tags
+  logger.info('Analyzing tag differences...');
+  const missingByTag = findMissingTags(shopifyProducts, poleepoMap, shopifyToPoleepo, tagFilter);
+
+  const sortedTags = [...missingByTag.entries()]
+    .sort((a, b) => b[1].poleepoIds.length - a[1].poleepoIds.length);
+
+  printSummary(sortedTags);
+
+  if (dryRun) {
+    logger.info('DRY RUN complete. No changes made.');
+    return;
+  }
+
+  if (sortedTags.length === 0) {
+    logger.info('No missing tags found. Nothing to do.');
+    return;
+  }
+
+  // 5. Execute assignments via browser
+  await executeAssignments(sortedTags);
 }
 
 main()

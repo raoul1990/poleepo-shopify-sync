@@ -104,15 +104,24 @@ function shutdown(signal: string): void {
     }
   }, 500);
 
-  // Force exit after 60 seconds
+  // Force exit after configured timeout
   setTimeout(() => {
     logger.error('Forced shutdown after timeout');
     process.exit(1);
-  }, 60_000);
+  }, config.sync.shutdownTimeoutMs);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  logger.error(`Unhandled rejection: ${msg}`);
+  // Reset sync lock to prevent permanent lockout
+  if (isSyncing) {
+    logger.warn('Resetting isSyncing flag after unhandled rejection');
+    isSyncing = false;
+  }
+});
 
 async function main(): Promise<void> {
   logger.info('Poleepo-Shopify Tag Sync Agent started');
