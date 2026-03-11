@@ -18,6 +18,9 @@ poleepo-shopify-sync/
 │   │   ├── product-matcher.ts   # Mapping prodotti via pubblicazioni Poleepo→Shopify
 │   │   ├── tag-normalizer.ts    # Parsing, normalizzazione, hash FNV-1a e merge tag
 │   │   └── state-manager.ts     # Gestione file di stato (sync-state.json)
+│   ├── scripts/
+│   │   ├── assign-tags.ts       # Assegnazione bulk tag via browser (standalone)
+│   │   └── test-connections.ts  # Test connessione API Poleepo e Shopify
 │   └── utils/
 │       ├── api-request.ts       # Fetch con timeout + retry automatico su 401
 │       ├── logger.ts            # Logger con timestamp ISO
@@ -60,7 +63,7 @@ Supporta due modalità (mutualmente esclusive):
 - **Incremental sync**: esecuzioni successive — sincronizza solo prodotti modificati (Shopify `updated_at_min` + Poleepo hash comparison)
 - **Merge non distruttivo**: i tag vengono solo aggiunti (unione), mai rimossi
 - **Prodotti eliminati**: 404 da Shopify → skip silenzioso + cleanup stato (non contato come errore)
-- **Deduplicazione**: case-insensitive di default, hash MD5 su tag normalizzati
+- **Deduplicazione**: case-insensitive di default, hash FNV-1a su tag normalizzati
 
 ### Notifiche Slack (`src/utils/slack.ts`)
 
@@ -80,7 +83,8 @@ Supporta due modalità (mutualmente esclusive):
 | `SHOPIFY_CLIENT_ID` | No* | — | Per client_credentials |
 | `SHOPIFY_CLIENT_SECRET` | No* | — | Per client_credentials |
 | `SYNC_CRON` | No | `0 */6 * * *` | Ogni 6 ore |
-| `SLACK_WEBHOOK_URL` | No | — | Per report Slack |
+| `SHUTDOWN_TIMEOUT_MS` | No | `60000` | Timeout shutdown (ms) |
+| `SLACK_WEBHOOK_URL` | No | — | Per report Slack (deve iniziare con `https://hooks.slack.com/`) |
 | `SLACK_BOT_TOKEN` | No | — | Per upload file |
 | `SLACK_CHANNEL_ID` | No | — | Per upload file |
 
@@ -89,9 +93,11 @@ Supporta due modalità (mutualmente esclusive):
 ## Comandi
 
 ```bash
-npm install          # Installa dipendenze
-npm run build        # Compila TypeScript
-npm start            # Avvia (node dist/index.js)
+npm install              # Installa dipendenze
+npm run build            # Compila TypeScript
+npm start                # Avvia (node dist/index.js)
+npm run test:connections # Testa connessione API
+npm run assign-tags      # Assegna tag mancanti via browser
 ```
 
 ## Deploy (systemd)
@@ -105,7 +111,9 @@ journalctl -u poleepo-shopify-sync -f
 ## Note Sviluppo
 
 - Node.js 18+ (usa `fetch` nativo)
-- TypeScript strict mode, target ES2020
+- TypeScript strict mode, target ES2022
 - Rate limiting Shopify: token bucket 2 req/s, bucket size 40
-- Lock anti-concorrenza: `isSyncing` flag impedisce overlap cron
-- Graceful shutdown: attende fine sync su SIGTERM/SIGINT (timeout 60s)
+- Lock anti-concorrenza: `isSyncing` flag impedisce overlap cron + reset su unhandled rejection
+- Graceful shutdown: attende fine sync su SIGTERM/SIGINT (timeout configurabile via `SHUTDOWN_TIMEOUT_MS`)
+- Playwright lazy-loaded: caricato solo quando il browser fallback è necessario
+- Validazioni all'avvio: auth Shopify, formato Slack webhook URL, struttura sync-state.json

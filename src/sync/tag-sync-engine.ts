@@ -54,7 +54,7 @@ export class TagSyncEngine {
     for (const product of poleepoProducts) {
       for (const tag of product.tags || []) {
         if (tag.id && tag.value) {
-          const key = tag.value.trim().toLowerCase();
+          const key = normalizeTag(tag.value);
           if (!this.tagIdLookup.has(key)) {
             this.tagIdLookup.set(key, { id: tag.id, value: tag.value });
           }
@@ -62,6 +62,56 @@ export class TagSyncEngine {
       }
     }
     logger.info(`Tag ID lookup built: ${this.tagIdLookup.size} unique tags with IDs`);
+  }
+
+  /**
+   * Fetch all Poleepo products and prepare lookup structures.
+   */
+  private async fetchAndPreparePoleepo(): Promise<{
+    products: PoleepoProduct[];
+    productMap: Map<number, PoleepoProduct>;
+  }> {
+    const products = await this.poleepo.getAllProducts(config.sync.batchSize);
+    const productMap = new Map<number, PoleepoProduct>();
+    for (const p of products) productMap.set(p.id, p);
+    this.buildTagIdLookup(products);
+    return { products, productMap };
+  }
+
+  /**
+   * Process sync for a list of product pairs, accumulating results.
+   */
+  private async syncMappedProducts(
+    pairs: { poleepoId: number; shopifyId: string; poleepoProduct?: PoleepoProduct; shopifyProduct?: ShopifyProduct }[],
+    result: SyncResult,
+    state: SyncState
+  ): Promise<void> {
+    for (const { poleepoId, shopifyId, poleepoProduct, shopifyProduct } of pairs) {
+      if (!poleepoProduct || !shopifyProduct) {
+        logger.debug(
+          `Skipping poleepo:${poleepoId} <-> shopify:${shopifyId}: product not found`
+        );
+        continue;
+      }
+
+      result.analyzed++;
+      try {
+        const syncOutcome = await this.syncProductPair(
+          poleepoProduct, shopifyProduct, poleepoId, shopifyId
+        );
+        state.products[`poleepo_${poleepoId}`] = syncOutcome.productState;
+
+        if (syncOutcome.updatedShopify) result.toShopify++;
+        if (syncOutcome.updatedPoleepo) result.toPoleepo++;
+        if (syncOutcome.updatedShopify || syncOutcome.updatedPoleepo) result.modified++;
+        if (syncOutcome.detail) result.productDetails.push(syncOutcome.detail);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error(`Error syncing poleepo:${poleepoId} <-> shopify:${shopifyId}: ${message}`);
+        result.errors++;
+        result.errorDetails.push(`poleepo:${poleepoId} <-> shopify:${shopifyId}: ${message}`);
+      }
+    }
   }
 
   async run(): Promise<SyncResult> {
@@ -82,21 +132,11 @@ export class TagSyncEngine {
     };
     const state = createEmptyState();
 
-    // 1. Fetch all Poleepo products
     logger.info('Fetching all Poleepo products...');
-    const poleepoProducts = await this.poleepo.getAllProducts(config.sync.batchSize);
-    const poleepoMap = new Map<number, PoleepoProduct>();
-    for (const p of poleepoProducts) {
-      poleepoMap.set(p.id, p);
-    }
+    const { products: poleepoProducts, productMap: poleepoMap } = await this.fetchAndPreparePoleepo();
 
-    // 1b. Build tag ID lookup for bidirectional sync
-    this.buildTagIdLookup(poleepoProducts);
-
-    // 2. Build product mappings (SKU-based)
     const { mappings, publicationsMap } = await buildProductMappings(this.poleepo, poleepoProducts);
     state.publicationsMap = publicationsMap;
-
     result.totalMappings = mappings.length;
 
     if (mappings.length === 0) {
@@ -106,51 +146,19 @@ export class TagSyncEngine {
       return result;
     }
 
-    // 3. Fetch all Shopify products
     logger.info('Fetching all Shopify products...');
     const shopifyProducts = await this.shopify.getAllProducts();
     const shopifyMap = new Map<number, ShopifyProduct>();
-    for (const p of shopifyProducts) {
-      shopifyMap.set(p.id, p);
-    }
+    for (const p of shopifyProducts) shopifyMap.set(p.id, p);
 
-    // 4. Sync each mapped pair
-    for (const mapping of mappings) {
-      result.analyzed++;
-      const poleepoProduct = poleepoMap.get(mapping.poleepoId);
-      const shopifyProduct = shopifyMap.get(parseInt(mapping.shopifyId, 10));
+    const pairs = mappings.map((m) => ({
+      poleepoId: m.poleepoId,
+      shopifyId: m.shopifyId,
+      poleepoProduct: poleepoMap.get(m.poleepoId),
+      shopifyProduct: shopifyMap.get(parseInt(m.shopifyId, 10)),
+    }));
 
-      if (!poleepoProduct || !shopifyProduct) {
-        logger.debug(
-          `Skipping mapping poleepo:${mapping.poleepoId} <-> shopify:${mapping.shopifyId}: ` +
-          `product not found (poleepo: ${!!poleepoProduct}, shopify: ${!!shopifyProduct})`
-        );
-        continue;
-      }
-
-      try {
-        const syncOutcome = await this.syncProductPair(
-          poleepoProduct,
-          shopifyProduct,
-          mapping.poleepoId,
-          mapping.shopifyId
-        );
-
-        state.products[`poleepo_${mapping.poleepoId}`] = syncOutcome.productState;
-
-        if (syncOutcome.updatedShopify) result.toShopify++;
-        if (syncOutcome.updatedPoleepo) result.toPoleepo++;
-        if (syncOutcome.updatedShopify || syncOutcome.updatedPoleepo) result.modified++;
-        if (syncOutcome.detail) {
-          result.productDetails.push(syncOutcome.detail);
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logger.error(`Error syncing poleepo:${mapping.poleepoId} <-> shopify:${mapping.shopifyId}: ${message}`);
-        result.errors++;
-        result.errorDetails.push(`poleepo:${mapping.poleepoId} <-> shopify:${mapping.shopifyId}: ${message}`);
-      }
-    }
+    await this.syncMappedProducts(pairs, result, state);
 
     state.lastSyncTime = new Date().toISOString();
     saveState(state);
@@ -169,16 +177,8 @@ export class TagSyncEngine {
       publicationsMap: { ...previousState.publicationsMap },
     };
 
-    // 1. Fetch all Poleepo products and check for new publications
     logger.info('Fetching Poleepo products for hash comparison...');
-    const poleepoProducts = await this.poleepo.getAllProducts(config.sync.batchSize);
-    const poleepoMap = new Map<number, PoleepoProduct>();
-    for (const p of poleepoProducts) {
-      poleepoMap.set(p.id, p);
-    }
-
-    // Build tag ID lookup for bidirectional sync
-    this.buildTagIdLookup(poleepoProducts);
+    const { products: poleepoProducts, productMap: poleepoMap } = await this.fetchAndPreparePoleepo();
 
     const { publicationsMap: currentPubMap } = await buildProductMappings(this.poleepo, poleepoProducts);
     const newMappings = findNewMappings(currentPubMap, previousState.publicationsMap);
@@ -189,50 +189,41 @@ export class TagSyncEngine {
       logger.info(`Found ${newMappings.length} new product mappings`);
     }
 
-    // 2. Fetch Shopify products updated since last sync
+    // Fetch Shopify products updated since last sync
     logger.info('Fetching recently updated Shopify products...');
     const updatedShopifyProducts = await this.shopify.getAllProducts(previousState.lastSyncTime);
     const shopifyChangedIds = new Set(updatedShopifyProducts.map((p) => String(p.id)));
     const shopifyMap = new Map<number, ShopifyProduct>();
-    for (const p of updatedShopifyProducts) {
-      shopifyMap.set(p.id, p);
-    }
+    for (const p of updatedShopifyProducts) shopifyMap.set(p.id, p);
     logger.info(`Shopify: ${updatedShopifyProducts.length} products updated since last sync`);
 
-    // 3. Determine which products need syncing
-    const productsToSync = new Set<string>(); // poleepoId as string
+    // Determine which products need syncing
+    const productsToSync = new Set<string>();
 
-    // 4a. New mappings
-    for (const m of newMappings) {
-      productsToSync.add(String(m.poleepoId));
-    }
+    // New mappings
+    for (const m of newMappings) productsToSync.add(String(m.poleepoId));
 
-    // 4b. Shopify changed products (reverse lookup)
+    // Shopify changed products (reverse lookup)
     const shopifyToPoleepo = new Map<string, string>();
     for (const [poleepoId, shopifyId] of Object.entries(currentPubMap)) {
       shopifyToPoleepo.set(shopifyId, poleepoId);
     }
     for (const shopifyId of shopifyChangedIds) {
       const poleepoId = shopifyToPoleepo.get(shopifyId);
-      if (poleepoId) {
-        productsToSync.add(poleepoId);
-      }
+      if (poleepoId) productsToSync.add(poleepoId);
     }
 
-    // 4c. Poleepo products with changed tag hashes
+    // Poleepo products with changed tag hashes
     for (const poleepoProduct of poleepoProducts) {
       const stateKey = `poleepo_${poleepoProduct.id}`;
       const prevProductState = previousState.products[stateKey];
       if (!prevProductState) {
-        // New product or not previously tracked — sync if it has a mapping
         if (currentPubMap[String(poleepoProduct.id)]) {
           productsToSync.add(String(poleepoProduct.id));
         }
         continue;
       }
-
-      const currentPoleepoTags = poleepoTagsToStrings(poleepoProduct.tags || []);
-      const currentHash = computeTagHash(currentPoleepoTags);
+      const currentHash = computeTagHash(poleepoTagsToStrings(poleepoProduct.tags || []));
       if (currentHash !== prevProductState.poleepoTagHash) {
         productsToSync.add(String(poleepoProduct.id));
       }
@@ -240,18 +231,17 @@ export class TagSyncEngine {
 
     logger.info(`${productsToSync.size} products need syncing`);
 
-    // 5. Sync each product
+    // Resolve Shopify products and build pairs
+    const pairs: { poleepoId: number; shopifyId: string; poleepoProduct?: PoleepoProduct; shopifyProduct?: ShopifyProduct }[] = [];
+
     for (const poleepoIdStr of productsToSync) {
-      result.analyzed++;
       const poleepoId = parseInt(poleepoIdStr, 10);
       const shopifyIdStr = currentPubMap[poleepoIdStr];
       if (!shopifyIdStr) continue;
 
       const shopifyId = parseInt(shopifyIdStr, 10);
-      const poleepoProduct = poleepoMap.get(poleepoId);
-
-      // Fetch Shopify product if not already fetched
       let shopifyProduct = shopifyMap.get(shopifyId);
+
       if (!shopifyProduct) {
         try {
           const resp = await this.shopify.getProduct(shopifyId);
@@ -270,34 +260,15 @@ export class TagSyncEngine {
         }
       }
 
-      if (!poleepoProduct || !shopifyProduct) {
-        logger.debug(`Skipping poleepo:${poleepoId} <-> shopify:${shopifyIdStr}: product not found`);
-        continue;
-      }
-
-      try {
-        const syncOutcome = await this.syncProductPair(
-          poleepoProduct,
-          shopifyProduct,
-          poleepoId,
-          shopifyIdStr
-        );
-
-        state.products[`poleepo_${poleepoId}`] = syncOutcome.productState;
-
-        if (syncOutcome.updatedShopify) result.toShopify++;
-        if (syncOutcome.updatedPoleepo) result.toPoleepo++;
-        if (syncOutcome.updatedShopify || syncOutcome.updatedPoleepo) result.modified++;
-        if (syncOutcome.detail) {
-          result.productDetails.push(syncOutcome.detail);
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logger.error(`Error syncing poleepo:${poleepoId} <-> shopify:${shopifyIdStr}: ${message}`);
-        result.errors++;
-        result.errorDetails.push(`poleepo:${poleepoId} <-> shopify:${shopifyIdStr}: ${message}`);
-      }
+      pairs.push({
+        poleepoId,
+        shopifyId: shopifyIdStr,
+        poleepoProduct: poleepoMap.get(poleepoId),
+        shopifyProduct,
+      });
     }
+
+    await this.syncMappedProducts(pairs, result, state);
 
     state.lastSyncTime = new Date().toISOString();
     saveState(state);
